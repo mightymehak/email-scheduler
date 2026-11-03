@@ -1,0 +1,145 @@
+// Prisma schema for the email scheduler.
+// Postgres is the source of truth for every email; Redis/BullMQ only holds "when to run" jobs
+// that can be rebuilt from these rows (see src/workers/reconcile.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Lifecycle of a single email:
+// SCHEDULED -> PROCESSING (claimed by a worker) -> SENT
+//                         \-> SCHEDULED again (retry / rate-limit deferral) or FAILED (last attempt)
+enum EmailStatus {
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  // Optional so dev-login users (no Google account) can exist outside production.
+  googleId  String?  @unique
+  email     String   @unique
+  name      String
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  senders         Sender[]
+  campaigns       Campaign[]
+  emails          Email[]
+  slackConnection SlackConnection?
+}
+
+// An SMTP identity a user sends from (one Ethereal test account each).
+// Per-sender hourly limits and the min gap between sends are keyed by Sender.id.
+model Sender {
+  id        String   @id @default(cuid())
+  userId    String
+  // Display name used in the "From" header.
+  name      String
+  smtpHost  String
+  smtpPort  Int
+  // Ethereal uses the account address as the SMTP username, so this is also the From address.
+  smtpUser  String
+  // Stored in plain text: acceptable for throwaway Ethereal accounts, documented as a trade-off.
+  smtpPass  String
+  createdAt DateTime @default(now())
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+
+  @@index([userId])
+}
+
+// One "Schedule" click from the dashboard: shared content and pacing for many recipients.
+model Campaign {
+  id             String   @id @default(cuid())
+  userId         String
+  senderId       String
+  subject        String
+  body           String
+  startTime      DateTime
+  // Spacing between consecutive recipients when the schedule is first planned.
+  delayBetweenMs Int
+  // Per-campaign cap, enforced alongside the env-wide per-sender cap (whichever is stricter wins).
+  hourlyLimit    Int
+  totalEmails    Int
+  createdAt      DateTime @default(now())
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // NoAction: a sender that still has campaigns can't be deleted on its own. Unlike Restrict,
+  // Postgres checks it at the end of the statement, so deleting a User (which cascades to both
+  // its campaigns and senders) still works regardless of the order rows are removed.
+  sender Sender  @relation(fields: [senderId], references: [id], onDelete: NoAction)
+  emails Email[]
+
+  @@index([userId, createdAt])
+}
+
+// One row per recipient. This is the unit that is queued, rate-limited, sent and indexed.
+model Email {
+  id                  String      @id @default(cuid()) // also the BullMQ jobId and the SMTP Message-ID
+  campaignId          String
+  // Denormalised from Campaign so the dashboard tabs can filter by user without a join.
+  userId              String
+  toEmail             String
+  // Copied per row so each email (and its search document) is self-contained.
+  subject             String
+  body                String
+  // 0-based position within the campaign; used to keep order when emails are deferred.
+  sequence            Int
+  // The time first planned; scheduledAt can move later because of rate limiting.
+  originalScheduledAt DateTime
+  scheduledAt         DateTime
+  status              EmailStatus @default(SCHEDULED)
+  attempts            Int         @default(0)
+  // How many times a rate limit pushed this email into a later slot.
+  deferrals           Int         @default(0)
+  // Set when a worker claims the row; an old lockedAt means that worker died mid-send.
+  lockedAt            DateTime?
+  sentAt              DateTime?
+  messageId           String?
+  // Ethereal web URL to view the delivered message.
+  previewUrl          String?
+  error               String?
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // The same address can't be scheduled twice in one campaign (DB-level idempotency).
+  @@unique([campaignId, toEmail])
+  // "Scheduled" tab: WHERE userId AND status IN (...) ORDER BY scheduledAt.
+  @@index([userId, status, scheduledAt])
+  // "Sent" tab: WHERE userId AND status IN (...) ORDER BY updatedAt DESC
+  // (updatedAt, not sentAt, because FAILED rows have no sentAt; see email.service.ts).
+  @@index([userId, status, updatedAt])
+  // Restart reconciliation scans all SCHEDULED/PROCESSING rows across users.
+  @@index([status, scheduledAt])
+}
+
+// One Slack workspace connection per user; reconnecting overwrites it (upsert on userId).
+model SlackConnection {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  teamId      String
+  teamName    String
+  // Channel chosen in the Slack consent screen (present with the incoming-webhook scope).
+  channelId   String?
+  channelName String?
+  // Bot token, used for chat.postMessage when no webhook is available.
+  accessToken String
+  webhookUrl  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}

@@ -1,0 +1,61 @@
+# Local infrastructure for the email scheduler.
+# Start with: docker compose up -d
+# Data lives in named volumes, so `docker compose down` keeps it (use `down -v` to wipe).
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: scheduler-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: email_scheduler
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d email_scheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: scheduler-redis
+    # AOF persistence: every write is appended to a log and fsynced each second,
+    # so BullMQ's delayed jobs (stored in Redis) survive a Redis restart.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.2
+    container_name: scheduler-elasticsearch
+    environment:
+      - discovery.type=single-node
+      # Local dev only: no TLS / passwords so the client can talk plain HTTP.
+      - xpack.security.enabled=false
+      # Keep the JVM heap small so it runs comfortably on a laptop.
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  pgdata:
+  redisdata:
+  esdata:
