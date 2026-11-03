@@ -2,27 +2,27 @@ import { useId, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import { Alert } from '../components/ui/Alert';
 import { Button, IconButton } from '../components/ui/Button';
-import { ArrowLeftIcon, ChevronDownIcon, XIcon } from '../components/ui/icons';
+import { ArrowLeftIcon, XIcon } from '../components/ui/icons';
 import { useToast } from '../components/ui/Toast';
 import { AddSenderPanel } from '../features/compose/AddSenderPanel';
 import { RecipientsInput } from '../features/compose/RecipientsInput';
+import { SenderPicker } from '../features/compose/SenderPicker';
 import { SendLaterPopover } from '../features/compose/SendLaterPopover';
 import { useScheduleCampaign, useSenders } from '../features/compose/useCompose';
 import { tabPath } from '../features/emails/useTabParam';
 import { ApiError, errorMessage } from '../lib/api';
 import { cn } from '../lib/cn';
 import { formatDateTime } from '../lib/format';
-import type { ScheduleCampaignResult } from '../lib/types';
+import type { ScheduleCampaignResult, Sender } from '../lib/types';
 
 const MAX_SUBJECT_LENGTH = 300; // same limit as the backend
-// <select> value that opens the "New sender" panel instead of choosing a sender.
-const ADD_SENDER = '__add_sender__';
 
 type FieldName = 'sender' | 'recipients' | 'subject' | 'delay' | 'hourlyLimit' | 'body';
 type FieldErrors = Partial<Record<FieldName, string>>;
 
 // The API names some fields differently from the form (e.g. delayBetweenMs vs delay).
 const SERVER_FIELD_TO_FORM: Record<string, FieldName> = {
+  senderIds: 'sender',
   senderId: 'sender',
   emails: 'recipients',
   subject: 'subject',
@@ -55,7 +55,22 @@ function scheduledToast(result: ScheduleCampaignResult): string {
   const count = `${result.scheduledCount.toLocaleString()} ${result.scheduledCount === 1 ? 'email' : 'emails'}`;
   const when = new Date(result.firstSendAt).getTime() <= Date.now() + 60_000 ? 'starting now' : `starting ${formatDateTime(result.firstSendAt)}`;
   const queued = result.enqueued ? '' : ' The queue was unavailable, so sending starts when the worker restarts.';
-  return `Scheduled ${count} from ${result.sender.email}, ${when}.${queued}`;
+  const from = result.senders.length > 1 ? `${result.senders.length} senders` : result.sender.email;
+  return `Scheduled ${count} from ${from}, ${when}.${queued}`;
+}
+
+// Under the From pill: who the emails go out as, and how the hourly limit works with several senders.
+function SenderHint({ senders }: { senders: Sender[] }) {
+  const [first] = senders;
+  if (!first) return null;
+  const perSender = first.usage.hourlyLimit;
+  return (
+    <p className="mt-1.5 text-xs text-neutral-500">
+      {senders.length === 1
+        ? `Sends as “${first.name}” · ${first.usage.sentThisHour ?? '?'} / ${perSender} sent this hour`
+        : `Recipients are split between ${senders.length} senders in turn · each sends up to ${perSender} per hour, ${(perSender * senders.length).toLocaleString()} per hour together`}
+    </p>
+  );
 }
 
 // Label on the left, control on the right, error underneath: one row of the compose form.
@@ -93,8 +108,8 @@ export function ComposePage() {
   const schedule = useScheduleCampaign();
 
   const [values, setValues] = useState<FormValues>({ recipients: [], subject: '', delay: '', hourlyLimit: '', body: '' });
-  // '' = not chosen yet, which means "the first sender".
-  const [senderId, setSenderId] = useState('');
+  // Empty = not chosen yet, which means "the first sender".
+  const [senderIds, setSenderIds] = useState<string[]>([]);
   const [addingSender, setAddingSender] = useState(false);
   const [sendAt, setSendAt] = useState<Date | null>(null);
   // Errors only show after the first send attempt, then update live as fields are fixed.
@@ -102,8 +117,9 @@ export function ComposePage() {
   const [serverErrors, setServerErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
 
-  const selectedSenderId = senderId || senders.data?.[0]?.id || '';
-  const selectedSender = senders.data?.find((sender) => sender.id === selectedSenderId);
+  const firstSenderId = senders.data?.[0]?.id;
+  const selectedSenderIds = senderIds.length > 0 ? senderIds : firstSenderId ? [firstSenderId] : [];
+  const selectedSenders = (senders.data ?? []).filter((sender) => selectedSenderIds.includes(sender.id));
   const errors: FieldErrors = { ...(submitted ? validate(values) : {}), ...serverErrors };
 
   const update = <K extends keyof FormValues>(key: K, value: FormValues[K]) => {
@@ -128,7 +144,7 @@ export function ComposePage() {
         startTime: (sendAt ?? new Date()).toISOString(),
         delayBetweenMs: Number(values.delay) * 1000,
         hourlyLimit: Number(values.hourlyLimit),
-        ...(selectedSenderId ? { senderId: selectedSenderId } : {}),
+        senderIds: selectedSenderIds,
       },
       {
         onSuccess: (result) => {
@@ -152,8 +168,6 @@ export function ComposePage() {
       },
     );
   };
-
-  const usage = selectedSender?.usage;
 
   return (
     <div className="min-h-screen bg-white">
@@ -182,41 +196,21 @@ export function ComposePage() {
         {formError && <Alert tone="error">{formError}</Alert>}
 
         <Row label="From" htmlFor={id('from')} error={errors.sender ?? (senders.isError ? errorMessage(senders.error) : undefined)}>
-          <div className="relative inline-block max-w-full">
-            <select
-              id={id('from')}
-              value={addingSender ? ADD_SENDER : selectedSenderId}
-              onChange={(event) => {
-                if (event.target.value === ADD_SENDER) {
-                  setAddingSender(true);
-                } else {
-                  setAddingSender(false);
-                  setSenderId(event.target.value);
-                }
-              }}
-              disabled={senders.isPending || senders.isError}
-              className="max-w-full appearance-none truncate rounded-lg border-0 bg-surface py-2.5 pl-3 pr-10 text-base text-neutral-900 focus:outline-none focus:ring-2 focus:ring-brand-500"
-            >
-              {senders.isPending && <option>Loading senders…</option>}
-              {senders.data?.map((sender) => (
-                <option key={sender.id} value={sender.id}>
-                  {sender.email}
-                </option>
-              ))}
-              <option value={ADD_SENDER}>+ Add new sender…</option>
-            </select>
-            <ChevronDownIcon className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-neutral-500" />
-          </div>
-          {selectedSender && usage && !addingSender && (
-            <p className="mt-1.5 text-xs text-neutral-500">
-              Sends as “{selectedSender.name}” · {usage.sentThisHour ?? '?'} / {usage.hourlyLimit} sent this hour (each sender has its own limit)
-            </p>
-          )}
+          <SenderPicker
+            id={id('from')}
+            senders={senders.data}
+            selectedIds={selectedSenderIds}
+            onChange={setSenderIds}
+            onAddSender={() => setAddingSender(true)}
+            disabled={senders.isPending || senders.isError}
+          />
+          {!addingSender && <SenderHint senders={selectedSenders} />}
           {addingSender && (
             <AddSenderPanel
               defaultName={`Ethereal sender ${(senders.data?.length ?? 0) + 1}`}
               onCreated={(sender) => {
-                setSenderId(sender.id);
+                // Add the new sender to the selection rather than replacing it.
+                setSenderIds([...selectedSenderIds, sender.id]);
                 setAddingSender(false);
               }}
               onCancel={() => setAddingSender(false)}

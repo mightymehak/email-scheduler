@@ -122,6 +122,19 @@ export async function ensureDefaultSender(userId: string): Promise<void> {
 
 // Picks the sender for a new campaign: the requested one (must belong to the user),
 // otherwise the user's oldest sender, creating one first if they have none.
+// The senders a campaign will use, in the order given. Every id must belong to this user; with no
+// ids, the user's oldest sender is used (created on the fly if they have none yet).
+export async function resolveSendersForUser(userId: string, senderIds?: string[]): Promise<Sender[]> {
+  if (!senderIds || senderIds.length === 0) return [await resolveSenderForUser(userId)];
+  const found = await prisma.sender.findMany({ where: { id: { in: senderIds }, userId } });
+  const byId = new Map(found.map((sender) => [sender.id, sender]));
+  return senderIds.map((id) => {
+    const sender = byId.get(id);
+    if (!sender) throw new HttpError(404, 'Sender not found');
+    return sender;
+  });
+}
+
 export async function resolveSenderForUser(userId: string, senderId?: string): Promise<Sender> {
   if (senderId) {
     const sender = await prisma.sender.findFirst({ where: { id: senderId, userId } });

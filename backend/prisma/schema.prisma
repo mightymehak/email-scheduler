@@ -54,6 +54,7 @@ model Sender {
 
   user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   campaigns Campaign[]
+  emails    Email[]
 
   @@index([userId])
 }
@@ -62,6 +63,8 @@ model Sender {
 model Campaign {
   id             String   @id @default(cuid())
   userId         String
+  // The first sender chosen for the campaign. A campaign can use several senders; which one sends
+  // each email is stored on the Email row (Email.senderId).
   senderId       String
   subject        String
   body           String
@@ -89,6 +92,8 @@ model Email {
   campaignId          String
   // Denormalised from Campaign so the dashboard tabs can filter by user without a join.
   userId              String
+  // The sender (SMTP account) that sends this email; recipients are split across the campaign's senders.
+  senderId            String
   toEmail             String
   // Copied per row so each email (and its search document) is self-contained.
   subject             String
@@ -114,6 +119,8 @@ model Email {
 
   campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
   user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // NoAction for the same reason as Campaign.sender: deleting a user removes both sides together.
+  sender   Sender   @relation(fields: [senderId], references: [id], onDelete: NoAction)
 
   // The same address can't be scheduled twice in one campaign (DB-level idempotency).
   @@unique([campaignId, toEmail])
@@ -124,6 +131,8 @@ model Email {
   @@index([userId, status, updatedAt])
   // Restart reconciliation scans all SCHEDULED/PROCESSING rows across users.
   @@index([status, scheduledAt])
+  // Hourly-limit rescheduling counts a sender's unsent emails ahead of a given one.
+  @@index([senderId, status, originalScheduledAt])
 }
 
 // One Slack workspace connection per user; reconnecting overwrites it (upsert on userId).

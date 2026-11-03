@@ -46,5 +46,7 @@ export const MAX_ERROR_LENGTH = 1_000;
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
 export const MAX_SUBJECT_LENGTH = 300;
+// Senders one campaign can be split across.
+export const MAX_SENDERS_PER_CAMPAIGN = 20;
 // Characters of the body shown after the subject in the dashboard's email rows.
 export const BODY_PREVIEW_LENGTH = 140;

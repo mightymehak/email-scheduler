@@ -1,13 +1,13 @@
 import type { Campaign, EmailStatus } from '@prisma/client';
 import { z } from 'zod';
 import { env } from '../config/env.js';
-import { MAX_SUBJECT_LENGTH, SCHEDULE_TRANSACTION_TIMEOUT_MS } from '../config/constants.js';
+import { MAX_SENDERS_PER_CAMPAIGN, MAX_SUBJECT_LENGTH, SCHEDULE_TRANSACTION_TIMEOUT_MS } from '../config/constants.js';
 import { logger, prisma } from '../lib/clients.js';
 import { HttpError } from '../lib/http-error.js';
 import { buildPage, toSkipTake, type Page, type Pagination } from '../lib/pagination.js';
 import { enqueueEmails } from '../queues/email.queue.js';
 import { syncEmailsToSearch } from './search.service.js';
-import { resolveSenderForUser, toPublicSender, type PublicSender } from './sender.service.js';
+import { resolveSendersForUser, toPublicSender, type PublicSender } from './sender.service.js';
 
 export const scheduleCampaignSchema = z.object({
   subject: z.string().trim().min(1).max(MAX_SUBJECT_LENGTH),
@@ -19,6 +19,8 @@ export const scheduleCampaignSchema = z.object({
   startTime: z.coerce.date({ error: 'startTime must be an ISO date string or epoch milliseconds' }),
   delayBetweenMs: z.coerce.number({ error: 'delayBetweenMs must be a number' }).int().min(0),
   hourlyLimit: z.coerce.number({ error: 'hourlyLimit must be a number' }).int().min(1),
+  // Senders to split the recipients across. senderId (one sender) is still accepted for scripts.
+  senderIds: z.array(z.string().min(1)).min(1).max(MAX_SENDERS_PER_CAMPAIGN).optional(),
   senderId: z.string().min(1).optional(),
 });
 
@@ -48,7 +50,9 @@ function normalizeRecipients(raw: string[]): string[] {
 
 export interface ScheduleCampaignResult {
   campaign: Campaign;
+  // The first sender; `senders` lists all of them.
   sender: PublicSender;
+  senders: PublicSender[];
   scheduledCount: number;
   firstSendAt: Date;
   lastSendAt: Date;
@@ -58,7 +62,11 @@ export interface ScheduleCampaignResult {
 
 export async function scheduleCampaign(userId: string, input: ScheduleCampaignInput): Promise<ScheduleCampaignResult> {
   const recipients = normalizeRecipients(input.emails);
-  const sender = await resolveSenderForUser(userId, input.senderId);
+  const requestedIds = input.senderIds ?? (input.senderId ? [input.senderId] : undefined);
+  const senders = await resolveSendersForUser(userId, requestedIds && [...new Set(requestedIds)]);
+  // Round-robin: recipient 0 -> first sender, 1 -> second, ... Each sender then has its own
+  // hourly limit and send gap, so more senders means more emails per hour for the campaign.
+  const senderFor = (sequence: number) => senders[sequence % senders.length]!;
 
   // A start time in the past means "start now".
   const startMs = Math.max(input.startTime.getTime(), Date.now());
@@ -71,7 +79,7 @@ export async function scheduleCampaign(userId: string, input: ScheduleCampaignIn
       const campaign = await tx.campaign.create({
         data: {
           userId,
-          senderId: sender.id,
+          senderId: senders[0]!.id,
           subject: input.subject,
           body: input.body,
           startTime: new Date(startMs),
@@ -84,6 +92,7 @@ export async function scheduleCampaign(userId: string, input: ScheduleCampaignIn
         data: recipients.map((toEmail, sequence) => ({
           campaignId: campaign.id,
           userId,
+          senderId: senderFor(sequence).id,
           toEmail,
           subject: input.subject,
           body: input.body,
@@ -115,7 +124,8 @@ export async function scheduleCampaign(userId: string, input: ScheduleCampaignIn
   logger.info({ campaignId: campaign.id, count: emails.length, enqueued }, 'Campaign scheduled');
   return {
     campaign,
-    sender: toPublicSender(sender),
+    sender: toPublicSender(senders[0]!),
+    senders: senders.map(toPublicSender),
     scheduledCount: emails.length,
     firstSendAt: sendTimeFor(0),
     lastSendAt: sendTimeFor(recipients.length - 1),

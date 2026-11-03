@@ -101,12 +101,14 @@ export interface ScheduleCampaignInput {
   startTime: string;
   delayBetweenMs: number;
   hourlyLimit: number;
-  senderId?: string;
+  // Recipients are split across these senders, in turn.
+  senderIds: string[];
 }
 
 export interface ScheduleCampaignResult {
   campaign: { id: string; subject: string };
   sender: Omit<Sender, 'usage'>;
+  senders: Omit<Sender, 'usage'>[];
   scheduledCount: number;
   firstSendAt: string;
   lastSendAt: string;

@@ -146,7 +146,7 @@ type QueuePosition = Pick<Email, 'id' | 'originalScheduledAt' | 'sequence'>;
 async function countUnsentAhead(email: QueuePosition, scope: LimitScope): Promise<number> {
   const time = email.originalScheduledAt;
   const where: Prisma.EmailWhereInput = {
-    ...(scope.kind === 'sender' ? { campaign: { senderId: scope.senderId } } : { campaignId: scope.campaignId }),
+    ...(scope.kind === 'sender' ? { senderId: scope.senderId } : { campaignId: scope.campaignId }),
     status: { in: [EmailStatus.SCHEDULED, EmailStatus.PROCESSING] },
     OR: [
       { originalScheduledAt: { lt: time } },

@@ -67,7 +67,8 @@ export async function processEmailJob(job: Job<SendEmailJobData>, token?: string
 
   const email = await prisma.email.findUnique({
     where: { id: emailId },
-    include: { campaign: { include: { sender: true } } },
+    // The email's own sender (a campaign can be split across several) and the campaign's limit.
+    include: { sender: true, campaign: true },
   });
   if (!email) return { outcome: 'skipped', reason: 'email no longer exists' };
   if (isFinished(email.status)) return { outcome: 'skipped', reason: `already ${email.status}` };
@@ -92,7 +93,7 @@ export async function processEmailJob(job: Job<SendEmailJobData>, token?: string
   // Step 2: throttling. One atomic Redis check for the min gap, the sender's hourly limit and the
   // campaign's hourly limit. Nothing is counted unless all three pass.
   const { campaignId } = email;
-  const { senderId } = email.campaign;
+  const { senderId } = email;
   const slot = await acquireSendSlot({
     senderId,
     campaignId,
@@ -123,7 +124,7 @@ export async function processEmailJob(job: Job<SendEmailJobData>, token?: string
       userId: email.campaign.userId,
       limitKind: scope.kind,
       limit: scope.limit,
-      sender: email.campaign.sender,
+      sender: email.sender,
       campaign: { id: campaignId, subject: email.campaign.subject },
     });
     return delayUntil(job, token, sendAt.getTime());
@@ -134,7 +135,7 @@ export async function processEmailJob(job: Job<SendEmailJobData>, token?: string
   let sent;
   let sentAt: Date;
   try {
-    sent = await sendEmail(email.campaign.sender, {
+    sent = await sendEmail(email.sender, {
       id: email.id,
       to: email.toEmail,
       subject: email.subject,
@@ -178,6 +179,6 @@ export async function processEmailJob(job: Job<SendEmailJobData>, token?: string
     },
   });
   await syncEmailsToSearch([emailId]);
-  log.info({ to: email.toEmail, sender: email.campaign.sender.smtpUser, previewUrl: sent.previewUrl }, 'Email sent');
+  log.info({ to: email.toEmail, sender: email.sender.smtpUser, previewUrl: sent.previewUrl }, 'Email sent');
   return { outcome: 'sent', messageId: sent.messageId };
 }

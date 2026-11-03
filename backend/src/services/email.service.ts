@@ -71,14 +71,15 @@ export async function getEmailDetail(userId: string, emailId: string) {
     select: {
       ...emailListSelect,
       attempts: true,
-      campaign: { select: { hourlyLimit: true, delayBetweenMs: true, sender: { select: { name: true, smtpUser: true } } } },
+      sender: { select: { name: true, smtpUser: true } },
+      campaign: { select: { hourlyLimit: true, delayBetweenMs: true } },
     },
   });
   if (!email) throw new HttpError(404, 'Email not found');
-  const { campaign, ...rest } = email;
+  const { campaign, sender, ...rest } = email;
   return {
     ...rest,
-    sender: { name: campaign.sender.name, email: campaign.sender.smtpUser },
+    sender: { name: sender.name, email: sender.smtpUser },
     hourlyLimit: campaign.hourlyLimit,
     delayBetweenMs: campaign.delayBetweenMs,
   };

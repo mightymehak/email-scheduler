@@ -36,6 +36,7 @@ Sends survive restarts, are throttled per sender, and are never sent twice.
 **Scheduling and delivery**
 - Schedule a campaign (subject, body, up to 10,000 recipients, start time, delay between emails, hourly limit). Each recipient becomes its own email row and its own BullMQ delayed job.
 - Multiple senders: each sender is a separate Ethereal SMTP account with its own hourly limit and send gap. Senders are generated with one click, or you can add an Ethereal account you already have (its SMTP login is checked before it is saved).
+- **One campaign can use several senders:** tick them in **From**, and the recipients are split between them in turn (1st → A, 2nd → B, 3rd → C, 4th → A…). Each sender sends in parallel within its own limit, so three senders at 200/hour can deliver 600/hour for one campaign.
 - At most one send in progress per sender, a minimum gap between sends, and per-sender and per-campaign hourly limits, all enforced atomically in Redis so they hold across any number of workers.
 - Emails over a limit are moved to the next free slot in a later hour, in their original order. They are never dropped or failed.
 - Retries with exponential backoff for real SMTP failures. After the last attempt the email is marked **Failed** with the SMTP error.
@@ -46,7 +47,7 @@ Sends survive restarts, are throttled per sender, and are never sent twice.
 - **Scheduled** and **Sent** folders with counts, live refresh every 5s, pagination, a status filter and a manual refresh.
 - Search as you type through Elasticsearch: prefix matching ("h" finds "Hourly"), typo tolerance, filtered per user and per folder.
 - Email detail page: sender, recipient, time, status, failure reason, and a link to the delivered message on Ethereal.
-- Compose page: From (sender picker, add sender), To (recipient chips, typing or pasting addresses, **Upload List** for CSV/TXT with a count of detected, duplicate and invalid addresses), Subject, delay between emails, hourly limit, message, and **Send Later** with presets.
+- Compose page: From (pick one or several senders, add a sender), To (recipient chips, typing or pasting addresses, **Upload List** for CSV/TXT with a count of detected, duplicate and invalid addresses), Subject, delay between emails, hourly limit, message, and **Send Later** with presets.
 - Slack card: connect, send a test message, reconnect, disconnect.
 - Loading, empty and error states everywhere; toasts for results; works at phone width.
 
@@ -179,7 +180,7 @@ Then set `API_PUBLIC_URL` and `FRONTEND_URL` to `https://<your-static-domain>.ng
 ### Scheduling (no cron)
 `POST /api/campaigns/schedule`:
 1. The request is validated with zod. Recipients are trimmed, lower-cased, de-duplicated and checked as email addresses.
-2. In **one database transaction**, the campaign and one `Email` row per recipient are inserted. Recipient *i* is planned for `start + i × delay` (`scheduledAt`; `originalScheduledAt` keeps that first plan).
+2. In **one database transaction**, the campaign and one `Email` row per recipient are inserted. Recipient *i* is planned for `start + i × delay` (`scheduledAt`; `originalScheduledAt` keeps that first plan) and assigned sender *i mod (number of senders)* (`Email.senderId`).
 3. **After the commit**, one BullMQ job is added per email (`addBulk`, 500 per call) with `delay = scheduledAt − now`. Enqueueing happens only after the commit, so a job can never point at a row that was rolled back.
 4. The emails are indexed in Elasticsearch.
 
@@ -218,7 +219,7 @@ Waiting (gap) and deferring (hourly limit) use BullMQ's `moveToDelayed` + `Delay
 - Each worker process runs `WORKER_CONCURRENCY` jobs at once. Total parallelism is concurrency × worker processes.
 - Correctness never relies on in-memory state: the claim is in Postgres, and the gap and counters are in Redis.
 - **Minimum delay: 2 seconds between sends of the same sender** (`MIN_DELAY_BETWEEN_SENDS_MS`). The Redis key `rl:gap:{senderId}` holds a short `sending` lease while an SMTP call is in progress, then a `cooldown` lasting exactly the configured gap, starting when that send *finishes*. With 2 workers × 5 concurrency and 6 emails due at the same instant, the smallest gap measured between consecutive sends was **2.58 s**.
-- Different senders don't wait for each other.
+- Different senders don't wait for each other: in a campaign split across three senders, two senders' emails went out within 4 ms of each other.
 
 ### Hourly rate limiting
 - Two limits, and whichever is stricter wins:
@@ -288,7 +289,8 @@ Example:
 ```bash
 curl -X POST localhost:4000/api/campaigns/schedule -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"subject":"Hello","body":"Hi there","emails":["a@example.com","b@example.com"],
-       "startTime":"2026-11-04T10:00:00Z","delayBetweenMs":2000,"hourlyLimit":50}'
+       "startTime":"2026-11-04T10:00:00Z","delayBetweenMs":2000,"hourlyLimit":50,
+       "senderIds":["<senderId-A>","<senderId-B>"]}'      # optional; default = your first sender
 ```
 
 ---
@@ -299,7 +301,7 @@ curl -X POST localhost:4000/api/campaigns/schedule -H "Authorization: Bearer $TO
 |---|---|
 | Schedule via API, stored in Postgres | `POST /api/campaigns/schedule` → `campaign.service.ts`, `prisma/schema.prisma` |
 | BullMQ delayed jobs, no cron | `queues/email.queue.ts` (`delay`, `jobId = email.id`) |
-| Multiple senders via Ethereal | `sender.service.ts`, `mailer.service.ts`, Compose → From |
+| Multiple senders via Ethereal (also several per campaign) | `sender.service.ts`, `mailer.service.ts`, `campaign.service.ts` (round-robin split), `SenderPicker.tsx` |
 | Searchable via Elasticsearch | `search.service.ts`, `GET /api/emails/search`, search bar |
 | Live BullMQ dashboard | `routes/bull-board.ts` → `/admin/queues` |
 | Survives restarts, no duplicates | `workers/reconcile.ts`, conditional claim in `email.processor.ts`, Redis AOF |
@@ -338,6 +340,8 @@ curl -X POST localhost:4000/api/campaigns/schedule -H "Authorization: Bearer $TO
 - The Slack OAuth `state` is a signed, 10-minute token carrying the user id, with no nonce cookie: the callback may arrive on another domain (the tunnel), where the app's cookies aren't sent. The Google flow does use a nonce cookie.
 - **Elasticsearch is best effort.** Emails scheduled while it is down are missing from search until `npm run es:reindex`.
 
+- **Splitting across senders is round-robin by recipient order**, not by each sender's remaining capacity. If one chosen sender is already near its hourly limit, its share is rescheduled to later hours while the others keep sending. The campaign's own hourly limit applies to the campaign's total.
+
 **Product and design**
 - Emails are **plain text**, without attachments. The Figma's formatting toolbar, attachment clip, star, archive and delete icons were left out rather than shown as buttons that do nothing. The login page offers only Google, because there is no email/password account system.
 - Added on top of the Figma, because the assignment needs them: the Slack card, sent times on Sent rows, a Failed status with its reason, pagination, a status filter, and toasts.
@@ -356,7 +360,7 @@ curl -X POST localhost:4000/api/campaigns/schedule -H "Authorization: Bearer $TO
 
 ```
 backend/
-  prisma/schema.prisma            data model (User, Sender, Campaign, Email, SlackConnection)
+  prisma/schema.prisma            data model (User, Sender, Campaign, Email [with its sender], SlackConnection)
   src/server.ts | worker.ts       the two entry points
   src/app.ts                      Express app (routes, auth, Bull Board, errors)
   src/config/                     env validation (zod), fixed constants
