@@ -375,17 +375,3 @@ docker-compose.yml                Postgres, Redis, Elasticsearch
 
 ---
 
-## Verification scripts
-
-Run from `backend/`:
-
-```bash
-npm run typecheck                                   # strict TypeScript, no errors
-npm run prove:rate-limit                            # 50 simultaneous slot requests: never past the limit
-npm run load-test -- --count 1000                   # 1,000 emails due at once (needs ALLOW_DEV_LOGIN)
-npm run load-test -- --count 1000 --hourly-limit 50 --sender <senderId>
-npm run es:reindex [-- --recreate]                  # rebuild search from Postgres
-```
-
-**Restart check:** schedule 10 emails 5 s apart → stop the worker after a few are sent → (optionally `docker compose restart redis postgres`) → start it again. The rest are sent at their times, and
-`select count(*), count(distinct "messageId") from "Email" where status='SENT'` shows no duplicates.
